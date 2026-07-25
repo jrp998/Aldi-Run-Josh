@@ -470,7 +470,7 @@ body.sheet-open .bottom{
   <div class="brandrow">
     <div class="wordmark">ALDI <span>RUN</span></div>
     <div class="headright">
-      <span class="syncpill" id="syncPill">…</span>
+      <span class="syncpill" id="syncPill" title="Tap for sync detail">…</span>
       <div class="subtotal" id="headTotal"></div>
       <button class="gear" id="gearBtn" aria-label="Settings">&#9881;&#65039;</button>
     </div>
@@ -995,9 +995,12 @@ const FIREBASE_CONFIG = {
   messagingSenderId: "359626641383",
   appId:             "1:359626641383:web:7ad337c497f9045b51b742",
 };
-const HOUSEHOLD = "josh-andrea";
-const JAY_UID    = "PASTE_JOSH_UID_AFTER_FIRST_SIGNIN";
-const MONIKA_UID = "PASTE_ANDREA_UID_AFTER_FIRST_SIGNIN";
+const HOUSEHOLD  = "josh-andrea";
+/* Fill these in after Josh and Andrea have each opened the app once:
+   Firebase Console -> Authentication -> Users -> copy each UID.
+   Until then the app still works; names just fall back to the email prefix. */
+const JOSH_UID   = "PASTE_JOSH_UID_AFTER_FIRST_SIGNIN";
+const ANDREA_UID = "PASTE_ANDREA_UID_AFTER_FIRST_SIGNIN";
 /* Origins allowed to postMessage grocery imports (Plated) */
 const BRIDGE_ORIGINS = [location.origin];
 /* ========================================================= */
@@ -1023,12 +1026,24 @@ function now(){return Date.now();}
 function daysAgo(t){return Math.floor((now()-t)/86400000);}
 function buzz(ms){try{navigator.vibrate && navigator.vibrate(ms);}catch(e){}}
 
+function syncDetail(){
+  const lines = [
+    "Status: " + syncStatus,
+    "Firebase configured: " + (FB_READY ? "yes" : "NO — running local only"),
+    "Signed in: " + (fbUser ? ("yes ("+(prefs.name||prefs.uid||"?")+")") : "NO"),
+    "Connected: " + (fbConnected ? "yes" : "no"),
+    "Household: " + HOUSEHOLD,
+    lastSyncError ? ("Last error: " + lastSyncError) : "No write errors recorded"
+  ];
+  alert("Aldi Run sync\n\n" + lines.join("\n"));
+}
 function setSync(s){
   syncStatus=s;
   const el=$("#syncPill"); if(!el) return;
-  const map={saved:["Saved","#178841"],sync:["Syncing\u2026","#1CBBEE"],off:["Offline","#FF7800"],err:["Sync error","#D50029"],local:["Not signed in","#8FA5CE"],localonly:["Local only","#8FA5CE"]};
+  const map={saved:["Saved","#178841"],ready:["Connected","#1CBBEE"],sync:["Syncing\u2026","#1CBBEE"],off:["Offline","#FF7800"],err:["Sync error","#D50029"],local:["Not signed in","#8FA5CE"],localonly:["Local only","#8FA5CE"]};
   const m=map[s]||map.local;
   el.textContent=m[0]; el.style.background=m[1];
+  if(!el._bound){ el._bound=1; el.style.cursor="pointer"; el.onclick=()=>{ if(FB_READY && !fbUser) openSignIn(); else syncDetail(); }; }
 }
 
 function migrate(st){
@@ -1090,19 +1105,23 @@ function initFirebase(){
   fbDB   = firebase.database();
   fbDB.ref(".info/connected").on("value", s=>{
     fbConnected = !!s.val();
-    if(fbConnected){ setSync(fbUser?"saved":"local"); flushQueue(); }
+    if(fbConnected){ setSync(fbUser?"ready":"local"); flushQueue(); }
     else setSync(fbUser?"off":"local");
   });
   fbAuth.onAuthStateChanged(u=>{
     fbUser = u;
     if(u){
       prefs.uid = u.uid;
-      if(!prefs.name) prefs.name = (u.uid===JAY_UID)?"Jay":(u.uid===MONIKA_UID)?"Monika":(u.email||"").split("@")[0];
+      const known = (u.uid===JOSH_UID) ? "Josh" : (u.uid===ANDREA_UID) ? "Andrea" : "";
+      if(known) prefs.name = known;                                  // a known UID always wins
+      else if(!prefs.name) prefs.name = (u.email||"").split("@")[0];  // unknown device: fall back to email
       savePrefs();
       attachListeners();
       maybeOfferMigration();
       renderAll();
-      setSync("saved");
+      setSync("ready");
+      // prove the round-trip: write a heartbeat and watch it come back
+      verifyWrite();
     } else {
       setSync("local");
       openSignIn();
@@ -1112,9 +1131,25 @@ function initFirebase(){
 /* record-level write with offline queue */
 function fbWrite(path, value){
   if(!FB_READY || !fbUser){ return; }
-  const doSet = ()=> fbDB.ref(hh(path)).set(value).then(()=>setSync("saved")).catch(()=>{ queueOp(path,value); setSync("err"); });
+  const doSet = ()=> fbDB.ref(hh(path)).set(value).then(()=>setSync("saved")).catch(e=>{
+    lastSyncError = (e && (e.code||e.message)) || "unknown";
+    console.error("[AldiRun] write failed for", path, "→", lastSyncError, e);
+    queueOp(path,value); setSync("err");
+  });
   if(!fbConnected){ queueOp(path,value); setSync("off"); }
   else { setSync("sync"); doSet(); }
+}
+let lastSyncError = "";
+function verifyWrite(){
+  if(!FB_READY || !fbUser || !fbDB) return;
+  const ref = fbDB.ref(hh("meta/heartbeat"));
+  ref.set({ by: prefs.uid||"?", at: now() })
+    .then(()=>{ setSync("saved"); })
+    .catch(e=>{
+      lastSyncError = (e && (e.code||e.message)) || "unknown";
+      console.error("[AldiRun] HEARTBEAT write REJECTED →", lastSyncError, e);
+      setSync("err");
+    });
 }
 function queueOp(path,value){
   try{
@@ -1507,6 +1542,18 @@ function openRecentSheet(name, mem, rawText, mealName){
    In-app alerts (batched; NOT push — see settings note)
 ========================================================= */
 let bannerQueue = [];
+/* Items store whoever added them as a plain string, so anything written before the
+   UIDs were configured carries an email prefix. Resolve by UID where we can. */
+function whoName(rec){
+  if(!rec) return "Someone";
+  if(rec.addedByUid === JOSH_UID) return "Josh";
+  if(rec.addedByUid === ANDREA_UID) return "Andrea";
+  const n = rec.addedBy || "";
+  if(!n) return "Someone";
+  // tidy an email-ish prefix: "andrea.smith1" -> "Andrea"
+  const first = n.split(/[.\-_@]/)[0];
+  return first ? first.charAt(0).toUpperCase() + first.slice(1) : "Someone";
+}
 function onRemoteAdditions(fresh){
   if(!prefs.notif) return;
   const sess = state.session;
@@ -1531,7 +1578,7 @@ function onRemoteAdditions(fresh){
       showBanner("late", "\u26A0\uFE0F Added late: "+lates.map(l=>l.name).join(", ")+" \u2014 you may need to double back.");
     } else {
       buzz(30);
-      showBanner("info", (fresh[0].addedBy||"Someone")+" added "+fresh.length+" item"+(fresh.length===1?"":"s")+" while you\u2019re shopping.");
+      showBanner("info", whoName(fresh[0])+" added "+fresh.length+" item"+(fresh.length===1?"":"s")+" while you\u2019re shopping.");
     }
     saveState();
   } else {
@@ -1539,7 +1586,7 @@ function onRemoteAdditions(fresh){
     const since = fresh.filter(f=>f.addedAt>prefs.lastSeenAdd);
     if(!since.length) return;
     if(now()-(prefs.lastNotifAt||0) > 3600000){
-      const who = since[0].addedBy||"Your other half";
+      const who = whoName(since[0]);
       showBanner("info", who+" added "+since.length+" item"+(since.length===1?"":"s")+" to the list.");
       prefs.lastNotifAt = now(); savePrefs();
       buzz(20);
@@ -1720,7 +1767,9 @@ function renderTotals(){
   const sess = state.session;
   const btn = $("#shopStart");
   if(sess && !sess.finishedAt){
-    btn.textContent = (sess.startedBy===prefs.name?"\u25B6 Resume shop":"\u{1F6D2} "+(sess.startedBy||"Someone")+" is shopping");
+    const starter = sess.startedBy || "";
+    const starterNice = (starter && /[.\-_]/.test(starter)) ? (starter.split(/[.\-_]/)[0].charAt(0).toUpperCase()+starter.split(/[.\-_]/)[0].slice(1)) : starter;
+    btn.textContent = (starter===prefs.name?"\u25B6 Resume shop":"\u{1F6D2} "+(starterNice||"Someone")+" is shopping");
   } else {
     btn.textContent = "\u{1F6D2} Shop";
   }
@@ -2448,8 +2497,8 @@ function openSettings(){
   openSheetHtml(
     '<div class="sheethead"><div class="emo">\u2699\uFE0F</div><h3>Settings</h3></div>'+
     '<div class="field"><label>Your name (for \u201Cwho added what\u201D)</label>'+
-      '<div class="segpick"><button id="nmJay" class="'+(prefs.name==="Jay"?"on":"")+'">Jay</button>'+
-      '<button id="nmMon" class="'+(prefs.name==="Monika"?"on":"")+'">Monika</button></div></div>'+
+      '<div class="segpick"><button id="nmJay" class="'+(prefs.name==="Josh"?"on":"")+'">Josh</button>'+
+      '<button id="nmMon" class="'+(prefs.name==="Andrea"?"on":"")+'">Andrea</button></div></div>'+
     '<div class="field"><label>Alerts</label><div class="rowbtns">'+
       '<button id="stNotif">\u{1F514} List-change alerts <b>'+(prefs.notif?"ON":"OFF")+'</b></button>'+
       '<button id="stLate">\u26A0\uFE0F Instant added-late alerts while shopping <b>'+(prefs.lateBypass?"ON":"OFF")+'</b></button>'+
@@ -2480,7 +2529,7 @@ function openSettings(){
       :'<div class="hint">Firebase isn\u2019t configured yet \u2014 running in local-only mode. See the README to enable free live sync.</div>')
   );
   const nm=(v)=>{ prefs.name=v; savePrefs(); openSettings(); };
-  $("#nmJay").onclick=()=>nm("Jay"); $("#nmMon").onclick=()=>nm("Monika");
+  $("#nmJay").onclick=()=>nm("Josh"); $("#nmMon").onclick=()=>nm("Andrea");
   $("#stNotif").onclick=()=>{prefs.notif=!prefs.notif;savePrefs();openSettings();};
   $("#stLate").onclick=()=>{prefs.lateBypass=!prefs.lateBypass;savePrefs();openSettings();};
   $("#stWarn").onclick=()=>{prefs.warnShort=!prefs.warnShort;savePrefs();openSettings();};
@@ -2995,7 +3044,7 @@ function toast(msg){
    NOTE: this sw.js is network-first for the app shell and calls skipWaiting() on install,
    so a new version arrives on its own when online — reg.waiting is effectively never set.
    We therefore detect updates by comparing a build stamp against the copy on the server. */
-const AR_BUILD = "2026.07.17-5-ja";
+const AR_BUILD = "2026.07.17-8-ja";
 let swReg = null, swWaiting = null;
 function showUpdateReady(){
   const b = document.getElementById("updBanner");
@@ -3037,10 +3086,10 @@ if("serviceWorker" in navigator && location.protocol==="https:"){
   if(!prefs.name){
     openSheetHtml(
       '<div class="sheethead"><div class="emo">\u{1F44B}</div><h3>Who\u2019s this phone?</h3></div>'+
-      '<div class="rowbtns"><button id="fnJay">Jay</button><button id="fnMon">Monika</button></div>'
+      '<div class="rowbtns"><button id="fnJay">Josh</button><button id="fnMon">Andrea</button></div>'
     );
-    $("#fnJay").onclick=()=>{prefs.name="Jay";savePrefs();closeSheetPlain();};
-    $("#fnMon").onclick=()=>{prefs.name="Monika";savePrefs();closeSheetPlain();};
+    $("#fnJay").onclick=()=>{prefs.name="Josh";savePrefs();closeSheetPlain();};
+    $("#fnMon").onclick=()=>{prefs.name="Andrea";savePrefs();closeSheetPlain();};
   }
   initFirebase();
   renderAll();
