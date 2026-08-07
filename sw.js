@@ -1,5 +1,5 @@
 /* Aldi Run service worker — bump CACHE_VERSION whenever index.html changes */
-const CACHE_VERSION = "aldirun-ja-v4";
+const CACHE_VERSION = "aldirun-ja-v7";
 const APP_SHELL = [
   "./",
   "./index.html",
